@@ -1,3 +1,3 @@
-module github.com/trukeio/session2
+module github.com/rveen/session2
 
 go 1.23.6
