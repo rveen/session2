@@ -6,7 +6,9 @@ import (
 	"encoding/base64"
 	"io"
 	"net/http"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -123,12 +125,23 @@ type Options struct {
 	CookiePath string
 	// How often the store is checked for expired sessions. Default: 10s.
 	CleanInterval time.Duration
+	// Maximum number of stored sessions. 0 means unlimited. When the store is
+	// full, Add evicts the least recently accessed sessions to make room, so
+	// adding a session never fails.
+	MaxSessions int
 }
 
 type manager struct {
-	opts      Options
-	mu        sync.RWMutex
-	sessions  map[string]*Session
+	opts     Options
+	mu       sync.RWMutex
+	sessions map[string]*Session
+	// maxSessions mirrors opts.MaxSessions but may be changed after Init via
+	// SetMaxSessions. Guarded by mu.
+	maxSessions int
+	// highWater is the largest size sessions has reached since the last
+	// compaction. Go maps never shrink their bucket array on delete, so the
+	// cleaner rebuilds the map once occupancy drops far enough below it.
+	highWater int
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -147,9 +160,10 @@ func newManager(o Options) *manager {
 		o.CleanInterval = 10 * time.Second
 	}
 	m := &manager{
-		opts:     o,
-		sessions: make(map[string]*Session),
-		done:     make(chan struct{}),
+		opts:        o,
+		sessions:    make(map[string]*Session),
+		maxSessions: o.MaxSessions,
+		done:        make(chan struct{}),
 	}
 	go m.cleaner()
 	return m
@@ -169,8 +183,56 @@ func (m *manager) cleaner() {
 					delete(m.sessions, id)
 				}
 			}
+			m.compactLocked()
 			m.mu.Unlock()
 		}
+	}
+}
+
+// compactLocked rebuilds the session map once it has emptied out well below its
+// high-water mark. Deleting from a Go map leaves the bucket array allocated, so
+// without this a single traffic spike would raise the process floor for good.
+func (m *manager) compactLocked() {
+	n := len(m.sessions)
+	if m.highWater <= 1024 || n*4 >= m.highWater {
+		return
+	}
+	fresh := make(map[string]*Session, n)
+	for id, s := range m.sessions {
+		fresh[id] = s
+	}
+	m.sessions = fresh
+	m.highWater = n
+}
+
+// evictLRULocked drops the least recently accessed sessions to make room for
+// one more. It removes a batch rather than a single entry so that the O(n) scan
+// is amortized over many inserts once the store sits at its cap.
+func (m *manager) evictLRULocked() {
+	// Enough to seat the incoming session, which is at least one and may be
+	// many if SetMaxSessions has just lowered the cap.
+	batch := len(m.sessions) - m.maxSessions + 1
+	if b := m.maxSessions/64 + 1; b > batch {
+		batch = b
+	}
+
+	type entry struct {
+		id       string
+		accessed time.Time
+	}
+	entries := make([]entry, 0, len(m.sessions))
+	for id, s := range m.sessions {
+		entries = append(entries, entry{id, s.Accessed()})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].accessed.Before(entries[j].accessed)
+	})
+
+	if batch > len(entries) {
+		batch = len(entries)
+	}
+	for _, e := range entries[:batch] {
+		delete(m.sessions, e.id)
 	}
 }
 
@@ -198,7 +260,21 @@ func (m *manager) Add(sess *Session, w http.ResponseWriter) {
 		MaxAge:   int(m.opts.CookieMaxAge.Seconds()),
 	})
 	m.mu.Lock()
+	if m.maxSessions > 0 && len(m.sessions) >= m.maxSessions {
+		m.evictLRULocked()
+	}
 	m.sessions[sess.ID()] = sess
+	if len(m.sessions) > m.highWater {
+		m.highWater = len(m.sessions)
+	}
+	m.mu.Unlock()
+}
+
+// SetMaxSessions changes the cap after Init. 0 means unlimited. The new cap is
+// applied on the next Add; it does not evict sessions that are already stored.
+func (m *manager) SetMaxSessions(n int) {
+	m.mu.Lock()
+	m.maxSessions = n
 	m.mu.Unlock()
 }
 
@@ -230,31 +306,44 @@ func (m *manager) Len() int {
 // Package-level API
 // -------------------------------------------------------------------------
 
-var global = newManager(Options{AllowHTTP: true, CleanInterval: 30 * time.Minute})
+// global is swapped atomically because Init may run while other goroutines are
+// serving requests through Get/Add/Remove.
+var global atomic.Pointer[manager]
+
+func defaultOptions() Options {
+	return Options{AllowHTTP: true, CleanInterval: 30 * time.Minute}
+}
+
+func init() {
+	global.Store(newManager(defaultOptions()))
+}
 
 // Init closes the current global manager and replaces it with a new one
 // configured by o. Use this at startup or in tests to override defaults.
+//
+// Init discards every stored session. Call it once, at startup: it is not a
+// way to reconfigure a running server.
 func Init(o Options) {
-	global.Close()
-	global = newManager(o)
+	old := global.Swap(newManager(o))
+	old.Close()
 }
 
-func Reinit() {
-	global.Close()
-	global = newManager(Options{AllowHTTP: true, CleanInterval: 30 * time.Minute})
-}
+func Reinit() { Init(defaultOptions()) }
 
 // Get returns the session associated with r, or nil if none exists.
-func Get(r *http.Request) *Session { return global.Get(r) }
+func Get(r *http.Request) *Session { return global.Load().Get(r) }
 
 // Add stores sess and sets the session cookie on w.
-func Add(sess *Session, w http.ResponseWriter) { global.Add(sess, w) }
+func Add(sess *Session, w http.ResponseWriter) { global.Load().Add(sess, w) }
 
 // Remove deletes sess and instructs the client to clear its cookie.
-func Remove(sess *Session, w http.ResponseWriter) { global.Remove(sess, w) }
+func Remove(sess *Session, w http.ResponseWriter) { global.Load().Remove(sess, w) }
 
 // Close stops the background cleaner goroutine.
-func Close() { global.Close() }
+func Close() { global.Load().Close() }
 
 // Len returns the number of active sessions in the global manager.
-func Len() int { return global.Len() }
+func Len() int { return global.Load().Len() }
+
+// SetMaxSessions changes the global manager's session cap. 0 means unlimited.
+func SetMaxSessions(n int) { global.Load().SetMaxSessions(n) }
